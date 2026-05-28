@@ -88,6 +88,7 @@ typedef enum {
 } fsm_state_t;
 
 #define SEQUENCE_TIMEOUT_US     (5 * 1000 * 1000) // Timeout de 5 segundos entre tons (em microsegundos)
+#define DEBOUNCE_TIME_US        (150 * 1000)      // O tom deve soar por 150ms para ser considerado válido
 
 /* Global variable declarations */
 static adc_channel_t channel[1] = {ADC_CHANNEL_3};
@@ -383,7 +384,7 @@ void app_main(void)
 }
 
 /* *****************************************************************
- * TASK DE PROCESSAMENTO (Controlo de Sequências Dinâmicas de Abertura/Fecho)
+ * TASK DE PROCESSAMENTO (Implementação Completa do Ponto 3 - Debounce e Trava)
  * *****************************************************************/
 void pv_processor_task(void *pvParam)
 {
@@ -403,6 +404,12 @@ void pv_processor_task(void *pvParam)
     static fsm_state_t current_state = STATE_IDLE;
     static int64_t last_state_change_time = 0;
 
+    /* Variáveis do Ponto 3 - Gestão de Tempo, Debounce e Bloqueio de Repetição */
+    static int64_t tom_0_start_time = 0;
+    static int64_t tom_1_start_time = 0;
+    static int64_t tom_2_start_time = 0;
+    static int last_registered_tom = -1; // Guarda qual o último tom aceite (-1 = nenhum)
+
     for (;;) {
 
         xQueueReceive(XQ,
@@ -417,7 +424,7 @@ void pv_processor_task(void *pvParam)
                           MICEX_SOUND_SAMPLES_BUF_SIZE);
 
         /* *************************************************************
-         * PONTO 3 — DETEÇÃO POR FILTROS FIR FINAIS
+         * PONTO 3 — FILTRAGEM FIR (Deteção das Frequências Centrais)
          * *************************************************************/
         float energy_0 =
             detect_frequency_energy(sound_samp_buf_proc,
@@ -443,12 +450,46 @@ void pv_processor_task(void *pvParam)
         if (energy_1 > peak_energy_1) peak_energy_1 = energy_1;
         if (energy_2 > peak_energy_2) peak_energy_2 = energy_2;
 
-        /* Booleans de validação de tom baseados nos limiares */
-        bool tom_0_ativo = (rms > MIN_SIGNAL_RMS) && (energy_0 > DETECTION_THRESHOLD) && ((energy_0 / rms) > RATIO_THRESHOLD);
-        bool tom_1_ativo = (rms > MIN_SIGNAL_RMS) && (energy_1 > DETECTION_THRESHOLD) && ((energy_1 / rms) > RATIO_THRESHOLD);
-        bool tom_2_ativo = (rms > MIN_SIGNAL_RMS) && (energy_2 > DETECTION_THRESHOLD) && ((energy_2 / rms) > RATIO_THRESHOLD);
-
         int64_t current_time = esp_timer_get_time();
+
+        /* Booleans instantâneos de validação de tom baseados nos limiares */
+        bool tom_0_detectado = (rms > MIN_SIGNAL_RMS) && (energy_0 > DETECTION_THRESHOLD) && ((energy_0 / rms) > RATIO_THRESHOLD);
+        bool tom_1_detectado = (rms > MIN_SIGNAL_RMS) && (energy_1 > DETECTION_THRESHOLD) && ((energy_1 / rms) > RATIO_THRESHOLD);
+        bool tom_2_detectado = (rms > MIN_SIGNAL_RMS) && (energy_2 > DETECTION_THRESHOLD) && ((energy_2 / rms) > RATIO_THRESHOLD);
+
+        /* *************************************************************
+         * LÓGICA DE DEBOUNCE (PONTO 3 - Medição da estabilidade temporal)
+         * *************************************************************/
+        if (tom_0_detectado) {
+            if (tom_0_start_time == 0) tom_0_start_time = current_time;
+        } else {
+            tom_0_start_time = 0;
+        }
+
+        if (tom_1_detectado) {
+            if (tom_1_start_time == 0) tom_1_start_time = current_time;
+        } else {
+            tom_1_start_time = 0;
+        }
+
+        if (tom_2_detectado) {
+            if (tom_2_start_time == 0) tom_2_start_time = current_time;
+        } else {
+            tom_2_start_time = 0;
+        }
+
+        /* Booleans finais pós-debounce: O tom tem de estar ativo há pelo menos DEBOUNCE_TIME_US */
+        bool tom_0_estavel = (tom_0_start_time > 0) && ((current_time - tom_0_start_time) >= DEBOUNCE_TIME_US);
+        bool tom_1_estavel = (tom_1_start_time > 0) && ((current_time - tom_1_start_time) >= DEBOUNCE_TIME_US);
+        bool tom_2_estavel = (tom_2_start_time > 0) && ((current_time - tom_2_start_time) >= DEBOUNCE_TIME_US);
+
+        /* *************************************************************
+         * CONTROLO DE LIBERTAÇÃO DA NOTA (PONTO 3)
+         * Se o último tom registado deixou de ser ouvido, desbloqueia a FSM
+         * *************************************************************/
+        if (last_registered_tom == 0 && !tom_0_detectado) last_registered_tom = -1;
+        if (last_registered_tom == 1 && !tom_1_detectado) last_registered_tom = -1;
+        if (last_registered_tom == 2 && !tom_2_detectado) last_registered_tom = -1;
 
         /* *************************************************************
          * AVALIAÇÃO GLOBAL DE TIMEOUT
@@ -456,46 +497,52 @@ void pv_processor_task(void *pvParam)
          * *************************************************************/
         if (current_state != STATE_IDLE && (current_time - last_state_change_time) > SEQUENCE_TIMEOUT_US) {
             current_state = STATE_IDLE;
+            last_registered_tom = -1;
             printf("\n>>> [FSM] Timeout excedido entre tons! Reset para IDLE.");
         }
 
         /* *************************************************************
-         * MÁQUINA DE ESTADOS - FSM (Gatilhada pelas sequências 0121 e 2101)
+         * MÁQUINA DE ESTADOS - FSM (Gatilhada apenas por Notas Estáveis e Novas)
          * *************************************************************/
         switch (current_state) {
             
             case STATE_IDLE:
-                if (tom_0_ativo) {
+                if (tom_0_estavel && last_registered_tom != 0) {
                     current_state = STATE_OPEN_W_1;
                     last_state_change_time = current_time;
-                    printf("\n>>> [FSM] Iniciada Sequência de Abertura! [0]... (Espera Tom 1)");
-                } else if (tom_2_ativo) {
+                    last_registered_tom = 0;
+                    printf("\n>>> [FSM] Nota estável [0] aceite! Sequência de Abertura Iniciada... (Espera Tom 1)");
+                } else if (tom_2_estavel && last_registered_tom != 2) {
                     current_state = STATE_CLOSE_W_1;
                     last_state_change_time = current_time;
-                    printf("\n>>> [FSM] Iniciada Sequência de Fecho! [2]... (Espera Tom 1)");
+                    last_registered_tom = 2;
+                    printf("\n>>> [FSM] Nota estável [2] aceite! Sequência de Fecho Iniciada... (Espera Tom 1)");
                 }
                 break;
 
-            /* ------- FILUXO DA SEQUÊNCIA DE ABERTURA (0 -> 1 -> 2 -> 1) ------- */
+            /* ------- FLUXO DA SEQUÊNCIA DE ABERTURA (0 -> 1 -> 2 -> 1) ------- */
             case STATE_OPEN_W_1:
-                if (tom_1_ativo) {
+                if (tom_1_estavel && last_registered_tom != 1) {
                     current_state = STATE_OPEN_W_2;
                     last_state_change_time = current_time;
-                    printf("\n>>> [FSM] Sequência Abertura: [0 -> 1]... (Espera Tom 2)");
+                    last_registered_tom = 1;
+                    printf("\n>>> [FSM] Nota estável [1] aceite! Sequência Abertura: [0 -> 1]... (Espera Tom 2)");
                 }
                 break;
 
             case STATE_OPEN_W_2:
-                if (tom_2_ativo) {
+                if (tom_2_estavel && last_registered_tom != 2) {
                     current_state = STATE_OPEN_W_1_FINAL;
                     last_state_change_time = current_time;
-                    printf("\n>>> [FSM] Sequência Abertura: [0 -> 1 -> 2]... (Espera Tom 1 final)");
+                    last_registered_tom = 2;
+                    printf("\n>>> [FSM] Nota estável [2] aceite! Sequência Abertura: [0 -> 1 -> 2]... (Espera Tom 1 final)");
                 }
                 break;
 
             case STATE_OPEN_W_1_FINAL:
-                if (tom_1_ativo) {
-                    current_state = STATE_IDLE; // Processo terminado, volta a IDLE
+                if (tom_1_estavel && last_registered_tom != 1) {
+                    current_state = STATE_IDLE; 
+                    last_registered_tom = 1;
                     gpio_set_level(LED_GPIO_PIN, 1); // LIGA LED (Abre Porta)
                     printf("\n>>> [FSM] !!! SEQUÊNCIA DE ABERTURA COMPLETA (0121) !!! LED LIGADO (ON)");
                 }
@@ -503,24 +550,27 @@ void pv_processor_task(void *pvParam)
 
             /* ------- FLUXO DA SEQUÊNCIA DE FECHO (2 -> 1 -> 0 -> 1) ------- */
             case STATE_CLOSE_W_1:
-                if (tom_1_ativo) {
+                if (tom_1_estavel && last_registered_tom != 1) {
                     current_state = STATE_CLOSE_W_0;
                     last_state_change_time = current_time;
-                    printf("\n>>> [FSM] Sequência Fecho: [2 -> 1]... (Espera Tom 0)");
+                    last_registered_tom = 1;
+                    printf("\n>>> [FSM] Nota estável [1] aceite! Sequência Fecho: [2 -> 1]... (Espera Tom 0)");
                 }
                 break;
 
             case STATE_CLOSE_W_0:
-                if (tom_0_ativo) {
+                if (tom_0_estavel && last_registered_tom != 0) {
                     current_state = STATE_CLOSE_W_1_FINAL;
                     last_state_change_time = current_time;
-                    printf("\n>>> [FSM] Sequência Fecho: [2 -> 1 -> 0]... (Espera Tom 1 final)");
+                    last_registered_tom = 0;
+                    printf("\n>>> [FSM] Nota estável [0] aceite! Sequência Fecho: [2 -> 1 -> 0]... (Espera Tom 1 final)");
                 }
                 break;
 
             case STATE_CLOSE_W_1_FINAL:
-                if (tom_1_ativo) {
-                    current_state = STATE_IDLE; // Processo terminado, volta a IDLE
+                if (tom_1_estavel && last_registered_tom != 1) {
+                    current_state = STATE_IDLE;
+                    last_registered_tom = 1;
                     gpio_set_level(LED_GPIO_PIN, 0); // DESLIGA LED (Fecha Porta)
                     printf("\n>>> [FSM] !!! SEQUÊNCIA DE FECHO COMPLETA (2101) !!! LED DESLIGADO (OFF)");
                 }
@@ -531,7 +581,7 @@ void pv_processor_task(void *pvParam)
         loop_counter++;
         if (loop_counter >= 12) {
             printf("\n=================================================");
-            printf("\n        SISTEMA DE DUPLA SEQUÊNCIA ATIVO        ");
+            printf("\n        SISTEMA COGNITIVO COM DEBOUNCE (P3)      ");
             printf("\n=================================================");
             const char* state_str = (current_state == STATE_IDLE) ? "IDLE (Espera Tom 0 ou 2)" :
                                     (current_state == STATE_OPEN_W_1) ? "ABERTURA: Espera 1" :
@@ -540,10 +590,11 @@ void pv_processor_task(void *pvParam)
                                     (current_state == STATE_CLOSE_W_1) ? "FECHO: Espera 1" :
                                     (current_state == STATE_CLOSE_W_0) ? "FECHO: Espera 0" : "FECHO: Espera 1 Final";
             printf("\n[FSM Estado]   %s", state_str);
+            printf("\n[FSM Trava]    Bloqueado na nota: %d (-1 = livre)", last_registered_tom);
             printf("\n[RMS Global]   Atual: %.4f  | Histórico Max: %.4f", rms, peak_rms);
-            printf("\n[FREQ_0: 500Hz]  Atual: %.4f  | Ativo? %s", energy_0, tom_0_ativo ? "SIM" : "NAO");
-            printf("\n[FREQ_1: 1340Hz] Atual: %.4f  | Ativo? %s", energy_1, tom_1_ativo ? "SIM" : "NAO");
-            printf("\n[FREQ_2: 2180Hz] Atual: %.4f  | Ativo? %s", energy_2, tom_2_ativo ? "SIM" : "NAO");
+            printf("\n[FREQ_0: 500Hz]  Atual: %.4f  | Estável? %s", energy_0, tom_0_estavel ? "SIM" : "NAO");
+            printf("\n[FREQ_1: 1340Hz] Atual: %.4f  | Estável? %s", energy_1, tom_1_estavel ? "SIM" : "NAO");
+            printf("\n[FREQ_2: 2180Hz] Atual: %.4f  | Estável? %s", energy_2, tom_2_estavel ? "SIM" : "NAO");
             printf("\n=================================================\n");
             loop_counter = 0;
         }
@@ -569,8 +620,6 @@ static void continuous_adc_init(adc_channel_t *channel,
                                  uint8_t channel_num,
                                  adc_continuous_handle_t *out_handle)
 {
-    adc_continuous_handle_t handle = NULL;
-
     adc_continuous_handle_cfg_t adc_config = {
         .max_store_buf_size = MICEX_ADC_BUF_SIZE,
         .conv_frame_size = MICEX_ADC_FRAME_SIZE,
