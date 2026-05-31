@@ -14,5 +14,6 @@
     "--query-driver=**",
     "--compile-commands-dir=/home/pedreiras/dados/Pedagogic_stuff/ESP32/SamplesPP_EXP32C6_DEVKITC_1/MIC_ContRead/build"
   ],
-  "idf.flashType": "UART"
+  "idf.flashType": "UART",
+  "idf.portWin": "COM5"
 }
