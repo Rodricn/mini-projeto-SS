@@ -22,7 +22,7 @@
 
 #define MICEX_ADC_FRAME_SIZE      512
 #define MICEX_ADC_BUF_SIZE        (4 * MICEX_ADC_FRAME_SIZE)
-#define MICEX_ADC_SAMPLE_FREQ     (20 * 1000)
+#define MICEX_ADC_SAMPLE_FREQ     (20 * 1000)   /* fs = 20 kHz: > 2x a maior frequência de tom (2180 Hz) com margem */
 
 #define MICEX_SOUND_SAMPLES_BUF_SIZE     2048
 #define MAX_FILT_IR_LEN                  200
@@ -30,35 +30,41 @@
 
 #define LED_GPIO_PIN                     11
 
-#define FREQ_0      500  
-#define FREQ_1      1340 
-#define FREQ_2      2180 
+/*
+ * Frequências dos tons (turma P1, NMECs 120009 / 119527):
+ *   "0": 1 * 500              = 500  Hz
+ *   "1": 500 + 700 + 7*20     = 1340 Hz   (soma_digitos = 12+25 = 37 -> mod10 = 7)
+ *   "2": 1340 + 700 + 7*20    = 2180 Hz
+ */
+#define FREQ_0      500
+#define FREQ_1      1340
+#define FREQ_2      2180
 
-
-#define MIN_SIGNAL_RMS           0.030f  // Fica mesmo acima do teu ruído de silêncio (0.022)
-#define DETECTION_THRESHOLD      0.008f  // Vai detetar facilmente as tuas leituras que batiam nos 0.010
-#define RATIO_THRESHOLD          0.15f   // Muito permissivo, exige apenas 15% de pureza do som
+/* Limiares de deteção, calibrados experimentalmente face ao ruído de fundo medido (RMS ~0.022 em silêncio) */
+#define MIN_SIGNAL_RMS           0.030f
+#define DETECTION_THRESHOLD      0.008f
+#define RATIO_THRESHOLD          0.15f
 
 typedef enum {
-    STATE_IDLE,                 
-    STATE_OPEN_W_1,             
-    STATE_OPEN_W_2,             
-    STATE_OPEN_W_1_FINAL,       
-    STATE_CLOSE_W_1,            
-    STATE_CLOSE_W_0,            
+    STATE_IDLE,
+    STATE_OPEN_W_1,
+    STATE_OPEN_W_2,
+    STATE_OPEN_W_1_FINAL,
+    STATE_CLOSE_W_1,
+    STATE_CLOSE_W_0,
     STATE_CLOSE_W_1_FINAL,
     STATE_ERROR
 } fsm_state_t;
 
-#define SEQUENCE_TIMEOUT_US     (5 * 1000 * 1000) 
-#define DEBOUNCE_TIME_US        (150 * 1000)      
+#define SEQUENCE_TIMEOUT_US     (5 * 1000 * 1000)
+#define DEBOUNCE_TIME_US        (150 * 1000)
 
 static adc_channel_t channel[1] = {ADC_CHANNEL_3};
 static TaskHandle_t s_task_handle;
 
 static const char *TAG = "MIC_EXAMPLE";
 
-/* Alocação Global e Estática com ALIGN16 obrigatório para evitar Guru Meditation Errors no ESP-DSP */
+/* Alocação estática com ALIGN16, obrigatória para evitar erros no ESP-DSP */
 __attribute__((aligned(16))) uint8_t result[MICEX_ADC_FRAME_SIZE] = {0};
 __attribute__((aligned(16))) static float sound_samp_buf_ADC[MICEX_SOUND_SAMPLES_BUF_SIZE];
 __attribute__((aligned(16))) static float sound_samp_buf_proc[MICEX_SOUND_SAMPLES_BUF_SIZE];
@@ -71,28 +77,38 @@ __attribute__((aligned(16))) static float conv_out_2[CONV_OUT_LEN];
 
 QueueHandle_t XQ;
 
+/*
+ * Filtros FIR passa-banda (Hamming, fs = 20 kHz, ordem 40 / 41 coeficientes).
+ * Largura de banda de 100 Hz centrada em cada frequência de tom, garantindo
+ * atenuação >= 25 dB nas frequências dos restantes tons (ver relatório, secção
+ * de dimensionamento de filtros).
+ */
+
+/* Filtro passa-banda centrado em FREQ_0 = 500 Hz */
 __attribute__((aligned(16))) float filtro_real_tom_0[] = {
-    -0.0034f, -0.0037f, -0.0037f, -0.0030f, -0.0014f,  0.0011f,  0.0044f,  0.0083f,  0.0125f,  0.0166f,
-     0.0203f,  0.0232f,  0.0251f,  0.0259f,  0.0255f,  0.0238f,  0.0210f,  0.0173f,  0.0130f,  0.0082f,
-     0.0034f,  0.0082f,  0.0130f,  0.0173f,  0.0210f,  0.0238f,  0.0255f,  0.0259f,  0.0251f,  0.0232f,
-     0.0203f,  0.0166f,  0.0125f,  0.0083f,  0.0044f,  0.0011f, -0.0014f, -0.0030f, -0.0037f, -0.0037f,
-    -0.0034f
+    -0.007247f, -0.007677f, -0.008860f, -0.010552f, -0.012375f, -0.013855f, -0.014478f, -0.013750f, -0.011256f, -0.006710f,
+    -0.000000f,  0.008787f,  0.019362f,  0.031246f,  0.043803f,  0.056290f,  0.067917f,  0.077915f,  0.085603f,  0.090443f,
+     0.092096f,  0.090443f,  0.085603f,  0.077915f,  0.067917f,  0.056290f,  0.043803f,  0.031246f,  0.019362f,  0.008787f,
+    -0.000000f, -0.006710f, -0.011256f, -0.013750f, -0.014478f, -0.013855f, -0.012375f, -0.010552f, -0.008860f, -0.007677f,
+    -0.007247f
 };
 
+/* Filtro passa-banda centrado em FREQ_1 = 1340 Hz */
 __attribute__((aligned(16))) float filtro_real_tom_1[] = {
-    -0.0016f,  0.0035f,  0.0046f, -0.0006f, -0.0054f, -0.0029f,  0.0049f,  0.0081f,  0.0013f, -0.0093f,
-    -0.0105f,  0.0001f,  0.0133f,  0.0138f, -0.0015f, -0.0186f, -0.0201f,  0.0003f,  0.0264f,  0.0355f,
-     0.0217f,  0.0355f,  0.0264f,  0.0003f, -0.0201f, -0.0186f, -0.0015f,  0.0138f,  0.0133f,  0.0001f,
-    -0.0105f, -0.0093f,  0.0013f,  0.0081f,  0.0049f, -0.0029f, -0.0054f, -0.0006f,  0.0046f,  0.0035f,
-    -0.0016f
+    -0.003929f, -0.001133f,  0.002573f,  0.007696f,  0.013919f,  0.019814f,  0.023053f,  0.021117f,  0.012265f, -0.003541f,
+    -0.024140f, -0.045340f, -0.061779f, -0.068318f, -0.061551f, -0.040999f, -0.009586f,  0.026811f,  0.060651f,  0.084558f,
+     0.093178f,  0.084558f,  0.060651f,  0.026811f, -0.009586f, -0.040999f, -0.061551f, -0.068318f, -0.061779f, -0.045340f,
+    -0.024140f, -0.003541f,  0.012265f,  0.021117f,  0.023053f,  0.019814f,  0.013919f,  0.007696f,  0.002573f, -0.001133f,
+    -0.003929f
 };
 
+/* Filtro passa-banda centrado em FREQ_2 = 2180 Hz */
 __attribute__((aligned(16))) float filtro_real_tom_2[] = {
-     0.0033f,  0.0005f, -0.0049f, -0.0040f,  0.0030f,  0.0061f, -0.0010f, -0.0082f, -0.0019f,  0.0093f,
-     0.0053f, -0.0098f, -0.0100f,  0.0085f,  0.0159f, -0.0051f, -0.0226f, -0.0011f,  0.0289f,  0.0125f,
-    -0.0336f,  0.0125f,  0.0289f, -0.0011f, -0.0226f, -0.0051f,  0.0159f,  0.0085f, -0.0100f, -0.0098f,
-     0.0053f,  0.0093f, -0.0019f, -0.0082f, -0.0010f,  0.0061f,  0.0030f, -0.0040f, -0.0049f,  0.0005f,
-     0.0033f
+     0.003097f,  0.007037f,  0.009084f,  0.007166f, -0.000579f, -0.013004f, -0.024390f, -0.026355f, -0.013028f,  0.013558f,
+     0.041967f,  0.055971f,  0.043618f,  0.005636f, -0.042425f, -0.076718f, -0.077529f, -0.040821f,  0.018040f,  0.071175f,
+     0.092425f,  0.071175f,  0.018040f, -0.040821f, -0.077529f, -0.076718f, -0.042425f,  0.005636f,  0.043618f,  0.055971f,
+     0.041967f,  0.013558f, -0.013028f, -0.026355f, -0.024390f, -0.013004f, -0.000579f,  0.007166f,  0.009084f,  0.007037f,
+     0.003097f
 };
 
 float *filter_0 = filtro_real_tom_0;
@@ -103,14 +119,14 @@ int filter_len_0 = sizeof(filtro_real_tom_0) / sizeof(float);
 int filter_len_1 = sizeof(filtro_real_tom_1) / sizeof(float);
 int filter_len_2 = sizeof(filtro_real_tom_2) / sizeof(float);
 
+/* Remove o nível DC do buffer e normaliza pela amplitude máxima do ADC (12 bits -> 2048) */
 static void preprocess_buffer(float *buf, int n)
 {
     float mean = 0.0f;
     for (int i = 0; i < n; i++) mean += buf[i];
     mean /= (float)n;
 
-    /* Escala fixa baseada no hardware ADC (12 bits -> amplitude max 2048) */
-    float fixed_scale = 1.0f / 2048.0f;
+    const float fixed_scale = 1.0f / 2048.0f;
     for (int i = 0; i < n; i++) {
         buf[i] = (buf[i] - mean) * fixed_scale;
     }
@@ -123,12 +139,25 @@ static float calculate_rms(float *buf, int n)
     return sqrtf(acc / n);
 }
 
+/*
+ * Convolui 'input' com 'filter' e devolve o RMS da região "válida" da saída
+ * (descartando as zonas de transiente nas extremidades, de tamanho filter_len-1
+ * em cada lado), evitando que os efeitos de borda da convolução distorçam a
+ * energia estimada.
+ */
 static float detect_frequency_energy(float *input, int input_len, float *filter, int filter_len, float *conv_out)
 {
     int out_len = input_len + filter_len - 1;
     memset(conv_out, 0, sizeof(float) * out_len);
     dsps_conv_f32(input, input_len, filter, filter_len, conv_out);
-    return calculate_rms(conv_out, out_len);
+
+    int valid_start = filter_len - 1;
+    int valid_len = out_len - 2 * valid_start;
+    if (valid_len <= 0) {
+        valid_start = 0;
+        valid_len = out_len;
+    }
+    return calculate_rms(&conv_out[valid_start], valid_len);
 }
 
 static void continuous_adc_init(adc_channel_t *channel, uint8_t channel_num, adc_continuous_handle_t *out_handle);
@@ -151,7 +180,7 @@ void app_main(void)
         .intr_type = GPIO_INTR_DISABLE
     };
     gpio_config(&io_conf);
-    gpio_set_level(LED_GPIO_PIN, 0); 
+    gpio_set_level(LED_GPIO_PIN, 0);
 
     memset(result, 0x00, MICEX_ADC_FRAME_SIZE);
 
@@ -180,7 +209,7 @@ void app_main(void)
                     adc_digi_output_data_t *p = (adc_digi_output_data_t*)&result[i];
                     uint32_t chan_num = p->type2.channel;
                     uint32_t data = p->type2.data;
-                    
+
                     if (chan_num == channel[0]) {
                         sound_samp_buf_ADC[sb_count] = (float)data;
                         sb_count++;
@@ -191,7 +220,7 @@ void app_main(void)
                         }
                     }
                 }
-                /* REMOVIDO o vTaskDelay(1) para evitar a perda de frames e falhas no áudio */
+                /* Sem vTaskDelay aqui: necessário para não perder frames a 20 kHz */
             } else if (ret == ESP_ERR_TIMEOUT) {
                 break;
             }
@@ -214,12 +243,12 @@ void pv_processor_task(void *pvParam)
 
     static int64_t error_start_time = 0;
     static int64_t last_blink_time = 0;
-    static uint32_t led_state = 0; 
+    static uint32_t led_state = 0;
 
     static int64_t tom_0_start_time = 0;
     static int64_t tom_1_start_time = 0;
     static int64_t tom_2_start_time = 0;
-    static int last_registered_tom = -1; 
+    static int last_registered_tom = -1;
 
     for (;;) {
 
@@ -275,7 +304,7 @@ void pv_processor_task(void *pvParam)
         }
 
         switch (current_state) {
-            
+
             case STATE_IDLE:
                 if (tom_0_estavel && last_registered_tom != 0) {
                     current_state = STATE_OPEN_W_1;
@@ -314,9 +343,9 @@ void pv_processor_task(void *pvParam)
 
             case STATE_OPEN_W_1_FINAL:
                 if (tom_1_estavel && last_registered_tom != 1) {
-                    current_state = STATE_IDLE; 
+                    current_state = STATE_IDLE;
                     last_registered_tom = 1;
-                    gpio_set_level(LED_GPIO_PIN, 1); 
+                    gpio_set_level(LED_GPIO_PIN, 1);
                     printf("\n>>> [FSM] !!! ABERTURA COMPLETA (0121) !!! LED LIGADO");
                 } else if ((tom_0_estavel && last_registered_tom != 0) || (tom_2_estavel && last_registered_tom != 2)) {
                     goto SEQUENCIA_ERRADA;
@@ -349,7 +378,7 @@ void pv_processor_task(void *pvParam)
                 if (tom_1_estavel && last_registered_tom != 1) {
                     current_state = STATE_IDLE;
                     last_registered_tom = 1;
-                    gpio_set_level(LED_GPIO_PIN, 0); 
+                    gpio_set_level(LED_GPIO_PIN, 0);
                     printf("\n>>> [FSM] !!! FECHO COMPLETO (2101) !!! LED DESLIGADO");
                 } else if ((tom_0_estavel && last_registered_tom != 0) || (tom_2_estavel && last_registered_tom != 2)) {
                     goto SEQUENCIA_ERRADA;
@@ -364,9 +393,14 @@ void pv_processor_task(void *pvParam)
                         last_blink_time = current_time;
                     }
                 } else {
-                    gpio_set_level(LED_GPIO_PIN, 0); 
+                    gpio_set_level(LED_GPIO_PIN, 0);
                     current_state = STATE_IDLE;
                     last_registered_tom = -1;
+                    /* Reinicia os temporizadores de estabilidade para evitar transições
+                       espúrias caso um tom tenha ficado "preso" durante o erro */
+                    tom_0_start_time = 0;
+                    tom_1_start_time = 0;
+                    tom_2_start_time = 0;
                     printf("\n>>> [FSM] Tempo de erro esgotado. Reset para IDLE.");
                 }
                 break;
@@ -375,13 +409,13 @@ void pv_processor_task(void *pvParam)
                 current_state = STATE_ERROR;
                 error_start_time = current_time;
                 last_blink_time = current_time;
-                led_state = 1; 
-                gpio_set_level(LED_GPIO_PIN, led_state); 
-                
+                led_state = 1;
+                gpio_set_level(LED_GPIO_PIN, led_state);
+
                 if (tom_0_estavel) last_registered_tom = 0;
                 else if (tom_1_estavel) last_registered_tom = 1;
                 else if (tom_2_estavel) last_registered_tom = 2;
-                
+
                 printf("\n>>> [FSM] ERRO NA SEQUÊNCIA! LED a piscar durante 5 segundos...");
                 break;
         }
@@ -414,7 +448,7 @@ void pv_processor_task(void *pvParam)
                      energy_0, tom_0_estavel,
                      energy_1, tom_1_estavel,
                      energy_2, tom_2_estavel);
-            
+
             printf("%s", print_buf);
             loop_counter = 0;
         }
@@ -445,7 +479,7 @@ static void continuous_adc_init(adc_channel_t *channel,
     adc_continuous_config_t dig_cfg = {
         .sample_freq_hz = MICEX_ADC_SAMPLE_FREQ,
         .conv_mode = MICEX_ADC_CONV_MODE,
-        .format = ADC_DIGI_OUTPUT_FORMAT_TYPE2, 
+        .format = ADC_DIGI_OUTPUT_FORMAT_TYPE2,
     };
 
     adc_digi_pattern_config_t adc_pattern[SOC_ADC_PATT_LEN_MAX] = {0};
