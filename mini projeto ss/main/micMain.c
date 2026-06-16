@@ -28,7 +28,6 @@
 
 /* Tamanho do bloco de amostras processado de cada vez */
 #define MICEX_SOUND_SAMPLES_BUF_SIZE     2048
-#define MAX_FILT_IR_LEN                  200
 #define CONV_OUT_LEN                     (MICEX_SOUND_SAMPLES_BUF_SIZE + 41 - 1)  /* tamanho da saída da convolução */
 
 #define LED_GPIO_PIN                     11   /* LED usado para simular a porta */
@@ -60,11 +59,14 @@ typedef enum {
     STATE_ERROR
 } fsm_state_t;
 
-#define SEQUENCE_TIMEOUT_US     (5 * 1000 * 1000)  /* tempo máximo entre tons antes de abortar a sequência */
-#define DEBOUNCE_TIME_US        (150 * 1000)        /* tempo que um tom deve estar estável para ser aceite */
+#define SEQUENCE_TIMEOUT_US     (5LL * 1000 * 1000)  /* tempo máximo entre tons antes de abortar a sequência */
+#define DEBOUNCE_TIME_US        (150LL * 1000)       /* tempo que um tom deve estar estável para ser aceite */
+#define ERROR_BLINK_DURATION_US (5LL * 1000 * 1000)  /* duração do LED a piscar quando a sequência é errada */
+#define ERROR_BLINK_PERIOD_US   (500LL * 1000)       /* meio-período do pisca do LED no estado de erro */
 
 static adc_channel_t channel[1] = {ADC_CHANNEL_3};  /* canal do ADC ligado ao microfone */
 static TaskHandle_t s_task_handle;
+static uint32_t door_is_open = 0;   /* estado atual da porta: 0 = fechada, 1 = aberta */
 
 static const char *TAG = "MIC_EXAMPLE";
 
@@ -365,6 +367,7 @@ void pv_processor_task(void *pvParam)
                     current_state = STATE_IDLE;
                     last_registered_tom = 1;
                     gpio_set_level(LED_GPIO_PIN, 1);
+                    door_is_open = 1;
                     printf("\n>>> [FSM] !!! ABERTURA COMPLETA (0121) !!! LED LIGADO");
                 } else if ((tom_0_estavel && last_registered_tom != 0) || (tom_2_estavel && last_registered_tom != 2)) {
                     goto SEQUENCIA_ERRADA;
@@ -399,6 +402,7 @@ void pv_processor_task(void *pvParam)
                     current_state = STATE_IDLE;
                     last_registered_tom = 1;
                     gpio_set_level(LED_GPIO_PIN, 0);
+                    door_is_open = 0;
                     printf("\n>>> [FSM] !!! FECHO COMPLETO (2101) !!! LED DESLIGADO");
                 } else if ((tom_0_estavel && last_registered_tom != 0) || (tom_2_estavel && last_registered_tom != 2)) {
                     goto SEQUENCIA_ERRADA;
@@ -407,21 +411,22 @@ void pv_processor_task(void *pvParam)
 
             case STATE_ERROR:
                 /* Pisca o LED durante 5 segundos para sinalizar sequência errada */
-                if ((current_time - error_start_time) < (5LL * 1000000LL)) {
-                    if ((current_time - last_blink_time) >= 500000LL) {
+                if ((current_time - error_start_time) < ERROR_BLINK_DURATION_US) {
+                    if ((current_time - last_blink_time) >= ERROR_BLINK_PERIOD_US) {
                         led_state = !led_state;
                         gpio_set_level(LED_GPIO_PIN, led_state);
                         last_blink_time = current_time;
                     }
                 } else {
-                    /* Passados os 5s, desliga o LED e volta a aceitar sequências */
-                    gpio_set_level(LED_GPIO_PIN, 0);
+                    /* Passados os 5s, repõe o LED no estado em que a porta estava antes do erro
+                       (uma sequência inválida não deve alterar o estado real da porta) e volta a IDLE */
+                    gpio_set_level(LED_GPIO_PIN, door_is_open);
                     current_state = STATE_IDLE;
                     last_registered_tom = -1;
                     tom_0_start_time = 0;
                     tom_1_start_time = 0;
                     tom_2_start_time = 0;
-                    printf("\n>>> [FSM] Tempo de erro esgotado. Reset para IDLE.");
+                    printf("\n>>> [FSM] Tempo de erro esgotado. Porta reposta no estado anterior.");
                 }
                 break;
 
@@ -459,13 +464,13 @@ void pv_processor_task(void *pvParam)
             char print_buf[512];
             snprintf(print_buf, sizeof(print_buf),
                      "\n=================================================\n"
-                     "[FSM] Estado: %s | Bloqueio Nota: %d\n"
+                     "[FSM] Estado: %s | Bloqueio Nota: %d | Porta: %s\n"
                      "[RMS] Atual: %.4f | Max: %.4f\n"
                      "[F0] Atual: %.4f | Estável: %d\n"
                      "[F1] Atual: %.4f | Estável: %d\n"
                      "[F2] Atual: %.4f | Estável: %d\n"
                      "=================================================\n",
-                     state_str, last_registered_tom,
+                     state_str, last_registered_tom, door_is_open ? "ABERTA" : "FECHADA",
                      rms, peak_rms,
                      energy_0, tom_0_estavel,
                      energy_1, tom_1_estavel,
